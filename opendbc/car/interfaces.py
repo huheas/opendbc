@@ -1,9 +1,12 @@
+from collections import deque
 import json
 import os
 import numpy as np
 import time
 import tomllib
+import math
 from abc import abstractmethod, ABC
+from difflib import SequenceMatcher
 from enum import StrEnum
 from typing import Any, NamedTuple
 from collections.abc import Callable
@@ -18,13 +21,16 @@ from opendbc.car.common.simple_kalman import KF1D, get_kalman_gain
 from opendbc.car.values import PLATFORMS
 from opendbc.can.parser import CANParser
 
+from openpilot.common.params import Params
+from openpilot.common.filter_simple import FirstOrderFilter
+
 GearShifter = structs.CarState.GearShifter
 ButtonType = structs.CarState.ButtonEvent.Type
 
 V_CRUISE_MAX = 145
 MAX_CTRL_SPEED = (V_CRUISE_MAX + 4) * CV.KPH_TO_MS
-ACCEL_MAX = 2.0
-ACCEL_MIN = -3.5
+ACCEL_MAX = 2.5
+ACCEL_MIN = -4.0 #3.5
 FRICTION_THRESHOLD = 0.3
 
 TORQUE_PARAMS_PATH = os.path.join(BASEDIR, 'torque_data/params.toml')
@@ -83,15 +89,115 @@ def get_torque_params():
 
   return torque_params
 
+class MyTrack:
+  def __init__(self, track_id: int, radar_point, dt: float):
+    self.track_id = track_id
+    self.cnt = 0
+    self.dRel = radar_point.dRel
+    self.vRel = radar_point.vRel
+    self.yRel = radar_point.yRel
+    self.vLead = radar_point.vLead
+    self.v_lead_filtered_last = self.vLead
+    self.aLead = 0.0
+    self.jLead = 0.0
+    self.dt = dt
+    self.vLead_avg = FirstOrderFilter(self.vLead, 0.1, self.dt)
+    self.aLead_avg = FirstOrderFilter(self.aLead, 0.15, self.dt)
+    self.jLead_avg = FirstOrderFilter(self.jLead, 0.4, self.dt)
+        
+  def update(self, radar_point):
+    self.vLead = radar_point.vLead
+    """
+    if abs(radar_point.dRel - self.dRel) > 3.0 or abs(self.vRel - radar_point.vRel) > 20.0 * self.dt:
+      self.cnt = 0
+      self.jLead = 0.0
+      self.aLead = 0.0
+      self.vLead_avg.x = self.vLead
+      self.aLead_avg.x = self.aLead
+      self.jLead_avg.x = self.jLead
+      self.v_lead_filtered_last = self.vLead
+    """
+
+    self.yRel = radar_point.yRel
+
+    v_lead_filtered = self.vLead_avg.update(self.vLead)
+    pseudo_stop = abs(v_lead_filtered) < 0.3 and abs(self.vLead - v_lead_filtered) < 0.05
+    a_raw = (v_lead_filtered - self.v_lead_filtered_last) / self.dt
+    self.v_lead_filtered_last = v_lead_filtered
+    a_lead = self.aLead_avg.update(a_raw if not pseudo_stop else 0.0)
+
+    j_lead = (a_lead - self.aLead) / self.dt
+    self.aLead = a_lead
+    self.jLead = self.jLead_avg.update(j_lead)
+
+    # Store latest values
+    self.dRel = radar_point.dRel
+    self.vRel = radar_point.vRel
+
+    self.cnt += 1
+
 # generic car and radar interfaces
-
-
 class RadarInterfaceBase(ABC):
   def __init__(self, CP: structs.CarParams):
     self.CP = CP
     self.rcp = None
+    self.tracks: dict[int, MyTrack] = {}
     self.pts: dict[int, structs.RadarData.RadarPoint] = {}
     self.frame = 0
+    delay = CP.radarDelay
+    self.v_ego_hist = deque([0.0], maxlen=int(round(delay / DT_CTRL)) + 1)
+    self.v_ego = 0.0
+    self.last_timestamp = None
+    self.dt = None
+
+    self.init_samples = []
+    self.init_done = False
+
+  def estimate_dt(self, rcv_time):
+    if len(self.init_samples) > 20:
+      estimated_dt = np.mean(np.diff(self.init_samples))
+      self.dt = estimated_dt
+      self.init_done = True
+      print(f"Estimated radar dt: {self.dt} sec")
+    else:
+      self.init_samples.append(rcv_time)
+
+     
+  def update_carrot(self, v_ego, rcv_time, can_packets: list[tuple[int, list[CanData]]]) -> structs.RadarDataT | None:
+    self.v_ego_hist.append(v_ego)
+    self.v_ego = self.v_ego_hist[0]
+    ret = self.update(can_packets)
+
+    if ret is not None:
+      if not self.init_done:
+        self.estimate_dt(rcv_time)
+        return None
+
+      new_tracks = {}
+      for addr, radar_point in self.pts.items():
+        track_id = radar_point.trackId
+        if track_id not in self.tracks:
+          new_tracks[track_id] = MyTrack(track_id, radar_point, self.dt)
+        else:
+          new_tracks[track_id] = self.tracks[track_id]
+        new_tracks[track_id].update(radar_point)
+
+        radar_point.aLead = float(new_tracks[track_id].aLead)
+        radar_point.jLead = float(new_tracks[track_id].jLead)
+                
+      self.tracks = new_tracks
+      """
+      if self.last_timestamp is not None:
+        print(f"dt1 = {rcv_time - self.last_timestamp:.6f}")
+      if self.last_timestamp is not None and (rcv_time - self.last_timestamp) < 0.045:  # 0.05 - 0.005
+        if self.last_timestamp is not None:
+          print(f"dt3 = {rcv_time - self.last_timestamp:.6f}")
+        return None
+      if self.last_timestamp is not None:
+        print(f"dt2 = {rcv_time - self.last_timestamp:.6f}")
+      self.last_timestamp = rcv_time
+      """
+    return ret
 
   def update(self, can_packets: list[tuple[int, list[CanData]]]) -> structs.RadarDataT | None:
     self.frame += 1
@@ -117,6 +223,8 @@ class CarInterfaceBase(ABC):
     dbc_names = {bus: cp.dbc_name for bus, cp in self.can_parsers.items()}
     self.CC: CarControllerBase = self.CarController(dbc_names, CP)
 
+    Params().put('LongitudinalPersonalityMax', "3")
+
   def apply(self, c: structs.CarControl, now_nanos: int | None = None) -> tuple[structs.CarControl.Actuators, list[CanData]]:
     if now_nanos is None:
       now_nanos = int(time.monotonic() * 1e9)
@@ -135,7 +243,7 @@ class CarInterfaceBase(ABC):
 
   @classmethod
   def get_params(cls, candidate: str, fingerprint: dict[int, dict[int, int]], car_fw: list[structs.CarParams.CarFw],
-                 experimental_long: bool, docs: bool) -> structs.CarParams:
+                 alpha_long: bool, docs: bool) -> structs.CarParams:
     ret = CarInterfaceBase.get_std_params(candidate)
 
     platform = PLATFORMS[candidate]
@@ -148,7 +256,11 @@ class CarInterfaceBase(ABC):
     ret.tireStiffnessFactor = platform.config.specs.tireStiffnessFactor
     ret.flags |= int(platform.config.flags)
 
-    ret = cls._get_params(ret, candidate, fingerprint, car_fw, experimental_long, docs)
+    ret = cls._get_params(ret, candidate, fingerprint, car_fw, alpha_long, docs)
+   
+
+    if Params().get_bool("DisableMinSteerSpeed"):
+      ret.minSteerSpeed = 0.
 
     # Vehicle mass is published curb weight plus assumed payload such as a human driver; notCars have no assumed payload
     if not ret.notCar:
@@ -163,7 +275,7 @@ class CarInterfaceBase(ABC):
   @staticmethod
   @abstractmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint: dict[int, dict[int, int]],
-                  car_fw: list[structs.CarParams.CarFw], experimental_long: bool, docs: bool) -> structs.CarParams:
+                  car_fw: list[structs.CarParams.CarFw], alpha_long: bool, docs: bool) -> structs.CarParams:
     raise NotImplementedError
 
   @staticmethod
@@ -294,6 +406,11 @@ class CarStateBase(ABC):
     x0=[[0.0], [0.0]]
     K = get_kalman_gain(DT_CTRL, np.array(A), np.array(C), np.array(Q), R)
     self.v_ego_kf = KF1D(x0=x0, A=A, C=C[0], K=K)
+    self.v_ego_clu_kf = KF1D(x0=x0, A=A, C=C[0], K=K)
+
+    self.softHoldActive = 0
+    self.is_metric = True
+    self.lkas_enabled = False
 
   @abstractmethod
   def update(self, can_parsers) -> structs.CarState:
@@ -304,6 +421,13 @@ class CarStateBase(ABC):
       self.v_ego_kf.set_x([[v_ego_raw], [0.0]])
 
     v_ego_x = self.v_ego_kf.update(v_ego_raw)
+    return float(v_ego_x[0]), float(v_ego_x[1])
+  
+  def update_clu_speed_kf(self, v_ego_raw):
+    if abs(v_ego_raw - self.v_ego_clu_kf.x[0][0]) > 2.0:  # Prevent large accelerations when car starts at non zero speed
+      self.v_ego_clu_kf.set_x([[v_ego_raw], [0.0]])
+
+    v_ego_x = self.v_ego_clu_kf.update(v_ego_raw)
     return float(v_ego_x[0]), float(v_ego_x[1])
 
   def get_wheel_speeds(self, fl, fr, rl, rr, unit=CV.KPH_TO_MS):

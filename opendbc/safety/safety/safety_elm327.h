@@ -38,4 +38,5 @@ const safety_hooks elm327_hooks = {
   .init = nooutput_init,
   .rx = default_rx_hook,
   .tx = elm327_tx_hook,
+  .fwd = default_fwd_hook,
 };

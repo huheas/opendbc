@@ -56,6 +56,8 @@ static void byd_rx_hook(const CANPacket_t *to_push) {
       unsigned int accstate = ((GET_BYTE(to_push, 2) >> 3) & 0x07U);
       bool cruise_engaged = (accstate == 3U) || (accstate == 5U); // 3=acc_active, 5=user force accel
       pcm_cruise_check(cruise_engaged);
+      UNUSED(cruise_engaged);
+      pcm_cruise_check(true);
     }
   }
   else {
@@ -66,7 +68,7 @@ static void byd_rx_hook(const CANPacket_t *to_push) {
 
 static bool byd_tx_hook(const CANPacket_t *to_send) {
   const TorqueSteeringLimits HAN_DMEV_STEERING_LIMITS = {
-    .max_torque = 300,
+    .max_steer = 300,
     .max_rate_up = 9,
     .max_rate_down = 9,
     .max_torque_error = 80,
@@ -132,7 +134,7 @@ static bool byd_tx_hook(const CANPacket_t *to_send) {
   return tx;
 }
 
-static bool byd_fwd_hook(int bus, int addr) {
+static int byd_fwd_hook(int bus, int addr) {
   bool block_msg = false;
 
   const bool is_lkas = ((addr == BYD_CANADDR_ACC_MPC_STATE) || (addr == BYD_CANADDR_ACC_CMD));
@@ -154,9 +156,9 @@ static safety_config byd_init(uint16_t param) {
   // const uint32_t FLAG_YUAN_PLUS_DMI_ATTO3 = 0x10U;
 
   static const CanMsg BYD_HAN_DMEV_TX_MSGS[] = {
-    {BYD_CANADDR_ACC_CMD,         BYD_CANBUS_ESC, 8, .check_relay = false},
-    {BYD_CANADDR_ACC_MPC_STATE,   BYD_CANBUS_ESC, 8, .check_relay = true},
-    {BYD_CANADDR_ACC_EPS_STATE,   BYD_CANBUS_MPC, 8, .check_relay = false},
+    {BYD_CANADDR_ACC_CMD,         BYD_CANBUS_ESC, 8},
+    {BYD_CANADDR_ACC_MPC_STATE,   BYD_CANBUS_ESC, 8},
+    {BYD_CANADDR_ACC_EPS_STATE,   BYD_CANBUS_MPC, 8},
   };
 
   // static const CanMsg BYD_YUANPLUS_ATTO3_TX_MSGS[] = {

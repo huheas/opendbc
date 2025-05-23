@@ -6,8 +6,7 @@ from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.gm.values import DBC, CanBus
 from opendbc.car.interfaces import RadarInterfaceBase
 
-RADAR_HEADER_MSG = 1120  # F_LRR_Obj_Header
-CAMERA_DATA_HEADER_MSG = 1056  # F_Vision_Obj_Header
+RADAR_HEADER_MSG = 1120
 SLOT_1_MSG = RADAR_HEADER_MSG + 1
 NUM_SLOTS = 20
 
@@ -87,6 +86,7 @@ class RadarInterface(RadarInterfaceBase):
         # From driver's pov, left is positive
         self.pts[targetId].yRel = math.sin(cpt['TrkAzimuth'] * CV.DEG_TO_RAD) * distance
         self.pts[targetId].vRel = cpt['TrkRangeRate']
+        self.pts[targetId].vLead = self.pts[targetId].vRel + self.v_ego
         self.pts[targetId].aRel = float('nan')
         self.pts[targetId].yvRel = float('nan')
 
