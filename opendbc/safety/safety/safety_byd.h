@@ -56,8 +56,6 @@ static void byd_rx_hook(const CANPacket_t *to_push) {
       unsigned int accstate = ((GET_BYTE(to_push, 2) >> 3) & 0x07U);
       bool cruise_engaged = (accstate == 3U) || (accstate == 5U); // 3=acc_active, 5=user force accel
       pcm_cruise_check(cruise_engaged);
-      UNUSED(cruise_engaged);
-      pcm_cruise_check(true);
     }
   }
   else {
